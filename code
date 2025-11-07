@@ -1,0 +1,170 @@
+import cv2
+import mediapipe as mp
+import time
+import csv
+import argparse
+from pathlib import Path
+
+mp_face_mesh = mp.solutions.face_mesh
+mp_drawing = mp.solutions.drawing_utils
+mp_styles = mp.solutions.drawing_styles
+
+def draw_landmarks(image, face_landmarks):
+    # Draw tessellation (full mesh)
+    mp_drawing.draw_landmarks(
+        image=image,
+        landmark_list=face_landmarks,
+        connections=mp_face_mesh.FACEMESH_TESSELATION,
+        landmark_drawing_spec=None,
+        connection_drawing_spec=mp_styles.get_default_face_mesh_tesselation_style()
+    )
+    # Draw contours (eyes, lips, face outline)
+    mp_drawing.draw_landmarks(
+        image=image,
+        landmark_list=face_landmarks,
+        connections=mp_face_mesh.FACEMESH_CONTOURS,
+        landmark_drawing_spec=None,
+        connection_drawing_spec=mp_styles.get_default_face_mesh_contours_style()
+    )
+    # Draw irises (if present)
+    if hasattr(mp_face_mesh, "FACEMESH_IRISES"):
+        mp_drawing.draw_landmarks(
+            image=image,
+            landmark_list=face_landmarks,
+            connections=mp_face_mesh.FACEMESH_IRISES,
+            landmark_drawing_spec=None,
+            connection_drawing_spec=mp_styles.get_default_face_mesh_iris_connections_style()
+        )
+
+def export_landmarks_to_csv(landmarks_list, width, height, csv_path, frame_id=None):
+    """
+    Save landmarks for the first detected face in a frame.
+    Each row: frame_id, idx, x(px), y(px), z (relative)
+    """
+    csv_path = Path(csv_path)
+    write_header = not csv_path.exists()
+    with csv_path.open("a", newline="") as f:
+        writer = csv.writer(f)
+        if write_header:
+            writer.writerow(["frame_id", "point_index", "x_px", "y_px", "z_rel"])
+        for idx, lm in enumerate(landmarks_list.landmark):
+            x_px = lm.x * width
+            y_px = lm.y * height
+            writer.writerow([frame_id if frame_id is not None else -1, idx, x_px, y_px, lm.z])
+
+def run_on_webcam(max_faces=2, min_det=0.5, min_track=0.5, export_csv=None):
+    cap = cv2.VideoCapture(0)
+    if not cap.isOpened():
+        raise RuntimeError("Could not open webcam (index 0).")
+
+    # Improve cam FPS on some systems
+    cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
+
+    with mp_face_mesh.FaceMesh(
+        max_num_faces=max_faces,
+        refine_landmarks=True,     # enables iris + more detailed landmarks
+        min_detection_confidence=min_det,
+        min_tracking_confidence=min_track
+    ) as face_mesh:
+
+        prev_time = time.time()
+        frame_id = 0
+
+        while True:
+            ok, frame = cap.read()
+            if not ok:
+                break
+
+            # MediaPipe expects RGB
+            rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+            rgb.flags.writeable = False
+            results = face_mesh.process(rgb)
+            rgb.flags.writeable = True
+
+            if results.multi_face_landmarks:
+                for face_landmarks in results.multi_face_landmarks:
+                    draw_landmarks(frame, face_landmarks)
+
+                # Optionally export the first face's landmarks per frame
+                if export_csv:
+                    h, w = frame.shape[:2]
+                    export_landmarks_to_csv(results.multi_face_landmarks[0], w, h, export_csv, frame_id)
+
+            # FPS overlay
+            now = time.time()
+            fps = 1.0 / (now - prev_time) if now != prev_time else 0.0
+            prev_time = now
+            cv2.putText(frame, f"FPS: {fps:.1f}", (10, 30),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.9, (0, 255, 0), 2, cv2.LINE_AA)
+
+            cv2.imshow("Face Landmarks - Webcam (q to quit)", frame)
+            frame_id += 1
+
+            if cv2.waitKey(1) & 0xFF in (ord('q'), 27):  # q or ESC
+                break
+
+    cap.release()
+    cv2.destroyAllWindows()
+
+def run_on_image(image_path, max_faces=2, min_det=0.5, export_csv=None, save_output=None):
+    img = cv2.imread(image_path)
+    if img is None:
+        raise FileNotFoundError(f"Could not read image: {image_path}")
+
+    with mp_face_mesh.FaceMesh(
+        static_image_mode=True,
+        max_num_faces=max_faces,
+        refine_landmarks=True,
+        min_detection_confidence=min_det
+    ) as face_mesh:
+
+        rgb = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
+        results = face_mesh.process(rgb)
+
+        if results.multi_face_landmarks:
+            for face_landmarks in results.multi_face_landmarks:
+                draw_landmarks(img, face_landmarks)
+
+            if export_csv:
+                h, w = img.shape[:2]
+                # Export only the first face for the image
+                export_landmarks_to_csv(results.multi_face_landmarks[0], w, h, export_csv, frame_id=0)
+
+    # Show and optionally save
+    cv2.imshow("Face Landmarks - Image (press any key to close)", img)
+    if save_output:
+        cv2.imwrite(save_output, img)
+        print(f"Saved output to: {save_output}")
+    cv2.waitKey(0)
+    cv2.destroyAllWindows()
+
+def parse_args():
+    p = argparse.ArgumentParser(description="Face landmark detection with OpenCV + MediaPipe")
+    src = p.add_mutually_exclusive_group(required=True)
+    src.add_argument("--webcam", action="store_true", help="Use webcam (index 0)")
+    src.add_argument("--image", type=str, help="Path to image file")
+
+    p.add_argument("--max-faces", type=int, default=2, help="Maximum faces to detect")
+    p.add_argument("--min-detection", type=float, default=0.5, help="Min detection confidence")
+    p.add_argument("--min-tracking", type=float, default=0.5, help="Min tracking confidence (webcam)")
+    p.add_argument("--csv", type=str, help="Optional CSV output path for landmarks")
+    p.add_argument("--save", type=str, help="When using --image, save annotated result here (e.g., out.jpg)")
+    return p.parse_args()
+
+if __name__ == "__main__":
+    args = parse_args()
+    if args.webcam:
+        run_on_webcam(
+            max_faces=args.max_faces,
+            min_det=args.min_detection,
+            min_track=args.min_tracking,
+            export_csv=args.csv
+        )
+    else:
+        run_on_image(
+            image_path=args.image,
+            max_faces=args.max_faces,
+            min_det=args.min_detection,
+            export_csv=args.csv,
+            save_output=args.save
+        )
